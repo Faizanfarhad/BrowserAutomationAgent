@@ -7,6 +7,7 @@ import httpx
 import json
 import asyncio
 from string import Template
+from pathlib import Path
 
 dotenv.load_dotenv()
 
@@ -32,23 +33,25 @@ class Planner:
         self.full_content = None
         self.replanning = replanning
         
-    def save_plan(self,plan):
-        i = 0
-        
-        if not os.path.exists("Planner/saved_plan"):
-          os.mkdir("Planner/saved_plan")
-         
-        if not self.replanning: 
-          path = f"Planner/saved_plan/plan{i}.json"
-        else:
-          path = f"Planner/saved_plan/replan{i}.json"
-          
-        if os.path.exists(path):
-            i+=1
-            
-        plan = json.loads(plan)
-        with open(path,"w") as file_json:
-            json.dump(plan,file_json,indent=4)
+    def save_plan(self, plan):
+      folder = Path("saved_plan")
+      folder.mkdir(parents=True, exist_ok=True)
+
+      prefix = "replan" if self.replanning else "plan"
+      index = 0
+
+      while (folder / f"{prefix}{index}.json").exists():
+          index += 1
+
+      path = folder / f"{prefix}{index}.json"
+
+      if isinstance(plan, str):
+          plan = json.loads(plan)
+
+      with path.open("w", encoding="utf-8") as file:
+          json.dump(plan, file, indent=4)
+
+      return plan
 
     async def call_api(self,provider,task,model_name,system_prompt):
         if provider == "gemini":
@@ -82,12 +85,18 @@ class Planner:
             text = candidates[0]["content"]["parts"][0]["text"] if candidates else ""
             print("\n=== API FINAL ANSWER ===", flush=True)
             print(text)
-            self.save_plan(text)
+            if text != "":
+              return self.save_plan(text)
+            else:
+              raise ValueError("plan can't be empty while saving")
         else:
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             print("\n=== API FINAL ANSWER ===", flush=True)
             print(text)
-            self.save_plan(text)
+            if text != "":
+              return self.save_plan(text)
+            else:
+              raise ValueError("plan can't be empty while saving")
           
     
     
@@ -715,10 +724,13 @@ class Planner:
                     print(chunk.message.content, end='', flush=True)
                     full_content += chunk.message.content
             
-            
-            self.save_plan(full_content)
+            if full_content != "":
+              return self.save_plan(full_content)
+            else:
+              raise ValueError("Plan can't be empty while saving")
         else:
-          await self.call_api(provider,task,model_name,system_prompt)
+          
+          return await self.call_api(provider,task,model_name,system_prompt)
         
   
 if __name__ == "__main__":

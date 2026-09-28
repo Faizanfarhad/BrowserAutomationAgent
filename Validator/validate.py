@@ -48,7 +48,7 @@ class Validater:
             on label ,
             on role
 
-            if locator count greater 0 then just process it further stages (dom_candidate -> candidate_filtering)
+            if locator count greater then 0 just process it further stages (dom_candidate -> candidate_filtering)
         Args:
             page (playwright): _description_
             target (str): _description_

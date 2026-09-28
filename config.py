@@ -4,7 +4,21 @@ MODEL_NAME = 'qwen3.5:4b'
 MAX_TOKEN = 2048
 DEEPSEEK_MODEL =  "deepseek-v4-flash"
 MODE = MODES[0]
+MAX_REPLAN_ATTEMPTS = 3
 
+REPLAN_IDX = 0
+PLAN_IDX = 0
+PLAN_PATH = f"saved_plan/plan{PLAN_IDX}.json"
+REPLAN_PATH = f"saved_plan/replan/replan{REPLAN_IDX}.json"
+SAVED_PLAN_PATH = "saved_plan"
+SAVED_REPLAN_PATH = "saved_plan/replan"
+
+
+
+
+#Task 
+
+TASK = None
 
 replanner_taks = """
         Fix the previously generated browser automation plan by correcting any invalid, missing, ambiguous, or incorrectly specified target elements.

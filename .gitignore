@@ -11,11 +11,11 @@ response.md
 
 .env
 
-
-Planner/saved_plan/
-
 architecture.txt
 
 response.md
 
 testing/
+
+saved_plan/
+state/agent_state.json
