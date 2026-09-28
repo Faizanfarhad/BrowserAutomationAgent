@@ -1,4 +1,4 @@
-# Browser Automation Agent
+# Browser Automation Agent(WIP)
 
 An LLM-driven browser automation prototype. It accepts a natural-language task, asks a language model to produce a structured action plan, checks that plan against a browser page, and executes it with Playwright when validation succeeds. Invalid plans are sent back through a bounded validation-and-replanning loop.
 
