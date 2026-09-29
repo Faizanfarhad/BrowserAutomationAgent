@@ -72,6 +72,7 @@ flowchart TD
 |   `-- validate.py             # URL, action, target, and wait validation
 |-- tools/
 |   |-- dom_observation.py      # DOM observations for failed target roles
+|   |-- download.py             # Direct file-response downloader
 |   `-- load_json.py            # JSON file/string loading helpers
 |-- state/
 |   |-- agent_state.py          # Atomic JSON state writer
@@ -94,7 +95,7 @@ The CLI accepts the task as positional text, so quote it when it contains shell-
 
 ### `Planner/planner.py`: plan generation
 
-`Planner.generate_plan()` assembles the initial-task or replan prompt, calls the configured model, and parses/saves the model's structured JSON plan. Plans use a top-level `steps` array. Supported action names are `navigate`, `click`, `fill`, `press`, `select`, `wait`, and `extract`.
+`Planner.generate_plan()` assembles the initial-task or replan prompt, calls the configured model, and parses/saves the model's structured JSON plan. Plans use a top-level `steps` array. Supported action names are `navigate`, `download`, `click`, `fill`, `press`, `select`, `wait`, and `extract`.
 
 Initial plans are saved as `saved_plan/planN.json`; replans are saved with a `replanN.json` name in `saved_plan/`. The planner supports an Ollama streaming path and HTTP API request paths. In the current CLI configuration, API mode chooses DeepSeek; other provider code is not exposed as a CLI option.
 
@@ -102,11 +103,11 @@ Initial plans are saved as `saved_plan/planN.json`; replans are saved with a `re
 
 `Executor.do_task()` creates numbered attempt records, validates the plan, requests replans when validation fails, and executes a plan only after it passes validation. `validate_plan()` launches headless Chromium. A valid plan is then executed in a separate headed Chromium context using the validation context's storage state.
 
-Execution dispatches each plan step to the corresponding Playwright operation. `get_target_locator()` resolves the semantic target through the validator. Extracted text/value is kept as the step result. Screenshots are written under `traces/` (`opened.png` and `action.png`).
+Execution dispatches each plan step to the corresponding Playwright operation. Direct file downloads use `tools/download.py` and are saved under `downloads/`; the saved path is stored as the step result. `get_target_locator()` resolves semantic targets through the validator. Extracted text/value is kept as the step result. Screenshots are written under `traces/` (`opened.png` and `action.png`).
 
 ### `Validator/validate.py`: pre-execution guardrail
 
-`Validater` checks the plan structure and supported action type. Navigation requires an HTTP or HTTPS URL with a host. Target actions require a semantic target with a non-empty role and name. The resolved candidate is checked for visibility and the action-specific property, such as enabled, editable, keyboard-capable, selectable, or readable.
+`Validater` checks the plan structure and supported action type. Navigation and download actions require an HTTP or HTTPS URL with a host; the download helper checks the response status and rejects HTML responses during execution. Target actions require a semantic target with a non-empty role and name. The resolved candidate is checked for visibility and the action-specific property, such as enabled, editable, keyboard-capable, selectable, or readable.
 
 Per-step validation records include the step number, action, role, rule description, and boolean validity. Structural errors are reported at plan level; target-check exceptions are collected in the validation result. Validation is a preflight check, not a replay or simulation of the action sequence.
 
@@ -151,6 +152,7 @@ Attempt keys are one-based (`Attempt1`, `Attempt2`); `replan_attempt` is zero-ba
 
 - `config.py` defines `MODE`, model names, `MAX_REPLAN_ATTEMPTS`, plan paths, and the replan instruction. The default mode is `Api`.
 - `tools/load_json.py` provides helpers to load JSON from a file or string. The executor's standalone entry point uses it to load `PLAN_PATH`.
+- `tools/download.py` fetches a direct file URL through the current Playwright page's request context, derives a safe filename, and returns the saved path.
 - `testing/testing.py` is a manual Playwright locator exploration script, not an automated regression test suite.
 - `free_memory/free_Mmemory.py` provides a process RSS / glibc memory-trim helper. `free_memory/free_vram.py` contains a PyTorch CUDA cache helper. Neither is called by the main agent flow.
 - `saved_plan/` contains sample plans and generated plans. `traces/` receives screenshots and is intended for run artifacts.
@@ -182,6 +184,7 @@ Target actions use Playwright semantic roles and accessible names, not planner-i
 | Action | Required fields |
 | --- | --- |
 | `navigate` | `url` |
+| `download` | `url` for a direct file response |
 | `click` | `target` |
 | `fill` | `target`, `value` |
 | `press` | `target`, `key` |
@@ -224,7 +227,7 @@ To execute a previously saved plan directly, set `PLAN_PATH` in `config.py` and 
 python Executor/action.py
 ```
 
-Generated plans/replans are saved to `saved_plan/`. The latest task state is written to `state/agent_state.json`. Screenshots are written to `traces/`.
+Generated plans/replans are saved to `saved_plan/`. The latest task state is written to `state/agent_state.json`. Downloads are saved to `downloads/`, and screenshots are written to `traces/`.
 
 ## Configuration
 
@@ -241,7 +244,9 @@ Generated plans/replans are saved to `saved_plan/`. The latest task state is wri
 
 - The validator loads the first valid navigation URL and checks planned targets against that page. It does not simulate clicks, form submissions, or page transitions before checking later steps.
 - The executor only supports duration-based waits. Although the validator accepts a wait condition, condition-based execution raises `NotImplementedError`.
-- Replanning occurs after pre-execution validation failures. An execution-time failure is saved in state and raised; it does not currently trigger automatic replanning.
+- Pre-execution validation failures and direct-download execution failures can trigger bounded replanning. Other execution-time failures are saved in state and raised.
+- A task that explicitly asks to download cannot be marked successful unless its plan contains a download action and execution saves the response successfully.
+- A `download` action requires a direct file URL. Finding a file by title on a website and navigating through search results is not yet reliable because validation does not simulate earlier page actions.
 - `collect_replan_data()` currently reports no successfully executed steps because replanning is initiated before plan execution.
 - Direct API actions, API-first routing, human clarification, and automatic state-based resume are not implemented.
 - The state file is a single latest-run snapshot and may contain task text, plan inputs, or extracted content. Protect it if those values are sensitive.

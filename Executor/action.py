@@ -1,15 +1,17 @@
 import asyncio
 import json
+import re
 from typing import Optional
 from playwright.async_api import Playwright, async_playwright, Page
 
-from tools.dom_observation import find_relevant_element
-from Validator.validate import Validater
 from Planner.planner import Planner
-from tools.load_json import dir_load_json
-from config import *
+from Validator.validate import Validater
 from state.agent_state import save_agent_state
+from config import *
 
+from tools.dom_observation import find_relevant_element
+from tools.load_json import dir_load_json
+from tools.download import download_url
 
 
 class Executor:
@@ -25,9 +27,107 @@ class Executor:
         self.agent_state = {"task": self.original_task}
         self.replan_attempt  = 0
         self.validation_result = None
+        self.failed_downloads = []
 
     def _persist_state(self):
         save_agent_state(self.agent_state)
+
+    def _task_requires_download(self):
+        return re.search(r"\bdownload(?:s|ed|ing)?\b", self.original_task, re.IGNORECASE) is not None
+
+    @staticmethod
+    def _plan_has_download(plan):
+        return isinstance(plan, dict) and any(
+            isinstance(step, dict) and step.get("action") == "download"
+            for step in plan.get("steps", [])
+        )
+
+    def _require_download_action(self, plan, validation_result):
+        if not self._task_requires_download():
+            return
+
+        download_steps = [
+            step
+            for step in plan.get("steps", [])
+            if isinstance(step, dict) and step.get("action") == "download"
+        ]
+        failed_urls = {
+            failure.get("plan_step", {}).get("url")
+            for failure in self.failed_downloads
+        }
+        reused_url = next(
+            (step.get("url") for step in download_steps if step.get("url") in failed_urls),
+            None,
+        )
+        if download_steps and reused_url is None:
+            return
+
+        current_url = next(
+            (
+                step.get("url")
+                for step in plan.get("steps", [])
+                if isinstance(step, dict) and step.get("action") == "navigate"
+            ),
+            None,
+        )
+        validation_result["valid"] = False
+        valid_info = validation_result.setdefault("valid_info", {})
+        valid_info["valid"] = False
+        valid_info.setdefault("errors", []).append(
+            (
+                f"Download URL already failed and must not be retried: {reused_url}"
+                if reused_url
+                else "The task requests a download, but the plan has no download action."
+            )
+        )
+        validation_result.setdefault(
+            "replan_data",
+            {
+                "executed_steps": {},
+                "failed_step": {
+                    f"download{index + 1}": failure
+                    for index, failure in enumerate(self.failed_downloads)
+                },
+                "current_url": current_url or "about:blank",
+                "dom_observations": {},
+            },
+        )
+
+    @staticmethod
+    def _download_failure_replan_data(plan, attempt_state, error):
+        execution_steps = attempt_state["execution"]["steps"]
+        failed_index = next(
+            (
+                index
+                for index, step_state in enumerate(execution_steps)
+                if step_state["status"] == "failed"
+                and step_state["action"] == "download"
+            ),
+            None,
+        )
+        if failed_index is None:
+            return None
+
+        executed_steps = {
+            f"step{index + 1}": {
+                "plan_step": plan["steps"][index],
+                "result": step_state["result"],
+            }
+            for index, step_state in enumerate(execution_steps)
+            if step_state["status"] == "succeeded"
+        }
+        failed_step = {
+            f"step{failed_index + 1}": {
+                "plan_step": plan["steps"][failed_index],
+                "error": str(error),
+            }
+        }
+        return {
+            "executed_steps": executed_steps,
+            "failed_step": failed_step,
+            "current_url": attempt_state["execution"].get("current_url"),
+            "dom_observations": {},
+        }
 
     def _new_attempt_state(self, attempt_number, plan):
         steps = plan.get("steps", []) if isinstance(plan, dict) else []
@@ -85,6 +185,7 @@ class Executor:
 
     async def do_task(self):
         self.agent_state = {"task": self.original_task}
+        self.failed_downloads = []
         self._persist_state()
         try:
             plan = self.get_plan()
@@ -114,17 +215,59 @@ class Executor:
             )
             try:
                 self.validation_result = await self.validate_plan(plan)
+                self._require_download_action(plan, self.validation_result)
                 attempt_state["validation"] = self.validation_result.get("valid_info")
                 self._persist_state()
 
                 if self.validation_result["valid"]:
                     attempt_state["status"] = "executing"
                     self._persist_state()
-                    await self.execute_valid_plan(
-                        plan,
-                        self.validation_result["storage_state"],
-                        attempt_state,
-                    )
+                    try:
+                        await self.execute_valid_plan(
+                            plan,
+                            self.validation_result["storage_state"],
+                            attempt_state,
+                        )
+                    except Exception as error:
+                        replan_data = self._download_failure_replan_data(
+                            plan,
+                            attempt_state,
+                            error,
+                        )
+                        if (
+                            replan_data is None
+                            or self.replan_attempt >= MAX_REPLAN_ATTEMPTS
+                        ):
+                            raise
+
+                        for failure in replan_data["failed_step"].values():
+                            if failure not in self.failed_downloads:
+                                self.failed_downloads.append(failure)
+
+                        attempt_state["status"] = "replanning"
+                        attempt_state["error"] = str(error)
+                        attempt_state["failure_stage"] = "download"
+                        self._persist_state()
+                        replan_context = {
+                            "valid_info": {
+                                "valid": False,
+                                "errors": [f"Download failed: {error}"],
+                            },
+                            "replan_data": replan_data,
+                        }
+                        new_plan = await self.create_replan(plan, replan_context)
+                        attempt_state["replan"] = {
+                            "status": "succeeded",
+                            "next_attempt": attempt_number + 1,
+                            "plan": new_plan,
+                        }
+                        attempt_state["status"] = "replanned"
+                        self._persist_state()
+                        plan = new_plan
+                        self.planning = new_plan
+                        self.replan_attempt += 1
+                        continue
+
                     attempt_state["status"] = "succeeded"
                     attempt_state["execution"]["current_step"] = None
                     self._persist_state()
@@ -191,7 +334,6 @@ class Executor:
                 )
                 if start_url and validator.is_url_valid(start_url):
                     await validation_page.goto(start_url)
-
                 await validator.validate()
                 valid_info = validator.valid_info
 
@@ -254,6 +396,7 @@ class Executor:
             step_state = attempt_state["execution"]["steps"][index]
             attempt_state["execution"]["current_step"] = index + 1
             step_state["status"] = "running"
+            attempt_state["execution"]["current_url"] = page.url
             self._persist_state()
 
             try:
@@ -264,6 +407,9 @@ class Executor:
                     await page.goto(url)
                     await page.wait_for_timeout(1000)
                     await page.screenshot(path="traces/opened.png")
+
+                elif action == "download":
+                    result = str(await download_url(page, step["url"]))
 
                 elif action in {"fill", "click", "press", "select", "extract"}:
                     locator = await self.get_target_locator(validator, page, step)

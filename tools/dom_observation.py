@@ -20,15 +20,30 @@ async def find_relevant_element(
 
             for index in range(total_relevant):
                 element = elements.nth(index)
+                
+                
+                try:
+                    is_visible = await element.is_visible(),
+                except:
+                    is_visible = False
+                try:
+                    is_enabled = await element.is_enabled(),
+                except:
+                    is_enabled = False
+                try:
+                    is_editable = await element.is_editable()
+                except:
+                    is_editable = False
+                 
                 relevant_data[f"relevant{index}"] = {
                     "tag": await element.evaluate("el => el.tagName.toLowerCase()"),
                     "id": await element.get_attribute("id"),
                     "type": await element.get_attribute("type"),
                     "name": await element.get_attribute("name"),
                     "placeholder": await element.get_attribute("placeholder"),
-                    "visible": await element.is_visible(),
-                    "enabled": await element.is_enabled(),
-                    "editable": await element.is_editable(),
+                    "visible": is_visible,
+                    "enabled": is_enabled,
+                    "editable":  is_editable ,
                 }
 
             first_match = relevant_data.get("relevant0", {})

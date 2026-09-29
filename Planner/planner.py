@@ -19,6 +19,8 @@ class ApiProviderError(Exception):
     """Raised when an external model provider cannot complete the request."""
 
 class Planner:
+    PLAN_RESPONSE_RETRIES = 2
+
     def __init__(self,mode:Optional[str | Literal["Local","Api"]],replanning:bool = False):
         """_summary_
 
@@ -53,50 +55,134 @@ class Planner:
 
       return plan
 
-    async def call_api(self,provider,task,model_name,system_prompt):
+    @staticmethod
+    def parse_plan_response(text):
+        """Parse a model response and require the expected plan structure."""
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            lines = candidate.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            candidate = "\n".join(lines).strip()
+
+        plan = json.loads(candidate)
+        if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
+            raise ValueError('Plan response must be a JSON object with a "steps" list')
+        if any(not isinstance(step, dict) for step in plan["steps"]):
+            raise ValueError('Every item in the plan "steps" list must be an object')
+        return plan
+
+    async def call_api(self, provider, task, model_name, system_prompt):
         if provider == "gemini":
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent"
+            )
             headers = {"Content-Type": "application/json"}
             payload = {
-                "contents": [{"parts": [{"text": str(task)}]}],
-                "generationConfig": {"maxOutputTokens": MAX_TOKEN, "temperature": 0},
+                "contents": [{
+                    "parts": [{
+                        "text": f"{system_prompt}\n\nUSER TASK:\n{task}"
+                    }]
+                }],
+                "generationConfig": {
+                    "maxOutputTokens": MAX_TOKEN,
+                    "temperature": 0,
+                },
             }
             params = {"key": GEMINI_API}
         else:
-            base_url = "https://api.deepseek.com" if provider == "deepseek" else "https://api.openai.com"
+            base_url = (
+                "https://api.deepseek.com"
+                if provider == "deepseek"
+                else "https://api.openai.com"
+            )
             url = f"{base_url}/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {DEEPSEEK_API}", "Content-Type": "application/json"}
+            headers = {
+                "Authorization": f"Bearer {DEEPSEEK_API}",
+                "Content-Type": "application/json",
+            }
             payload = {
                 "model": model_name,
-                "messages": [ {"role": "system", "content": str(system_prompt)},
-                            {"role": "user", "content": str(task)}],
+                "messages": [
+                    {"role": "system", "content": str(system_prompt)},
+                    {"role": "user", "content": str(task)},
+                ],
                 "max_tokens": MAX_TOKEN,
                 "temperature": 0,
             }
             params = None
-            
-        async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(url, headers=headers, params=params, json=payload)
-        if response.is_error:
-            raise ApiProviderError(f"{provider.title()} API error: {response.text[:500]}")
-        data = response.json()
-        if provider == "gemini":
-            candidates = data.get("candidates", [])
-            text = candidates[0]["content"]["parts"][0]["text"] if candidates else ""
+
+        last_error = "empty response"
+        for attempt in range(self.PLAN_RESPONSE_RETRIES + 1):
+            async with httpx.AsyncClient(timeout=90) as client:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                )
+            if response.is_error:
+                raise ApiProviderError(
+                    f"{provider.title()} API error: {response.text[:500]}"
+                )
+
+            data = response.json()
+            if provider == "gemini":
+                candidates = data.get("candidates", [])
+                raw_text = (
+                    candidates[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    if candidates
+                    else ""
+                )
+            else:
+                raw_text = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+            text = raw_text if isinstance(raw_text, str) else ""
             print("\n=== API FINAL ANSWER ===", flush=True)
             print(text)
-            if text != "":
-              return self.save_plan(text)
-            else:
-              raise ValueError("plan can't be empty while saving")
-        else:
-            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            print("\n=== API FINAL ANSWER ===", flush=True)
-            print(text)
-            if text != "":
-              return self.save_plan(text)
-            else:
-              raise ValueError("plan can't be empty while saving")
+            if text.strip():
+                try:
+                    plan = self.parse_plan_response(text)
+                except (json.JSONDecodeError, ValueError) as error:
+                    last_error = f"invalid plan JSON: {error}"
+                else:
+                    return self.save_plan(plan)
+
+            if not text.strip():
+                last_error = "empty response"
+
+            if attempt < self.PLAN_RESPONSE_RETRIES:
+                retry_instruction = (
+                    f"Your previous response had an error: {last_error}. "
+                    "Return a complete, non-empty JSON object with a top-level "
+                    '"steps" array. Include every closing bracket and brace. '
+                    "Do not include markdown fences, explanations, or thinking "
+                    "text. Use only supported actions. If a direct file URL is "
+                    "unknown, return a minimal navigation/search plan instead "
+                    "of an empty response."
+                )
+                if provider == "gemini":
+                    payload["contents"][0]["parts"][0]["text"] += (
+                        f"\n\n{retry_instruction}"
+                    )
+                else:
+                    payload["messages"][0]["content"] += (
+                        f"\n\n{retry_instruction}"
+                    )
+
+        raise ApiProviderError(
+            f"{provider.title()} API did not return a valid plan after "
+            f"{self.PLAN_RESPONSE_RETRIES} retries: {last_error}"
+        )
           
     
     
@@ -157,6 +243,7 @@ class Planner:
                   5. Use ONLY the following action types:
 
                      - navigate
+                     - download
                      - click
                      - fill
                      - press
@@ -175,8 +262,33 @@ class Planner:
                        "url": "https://example.com"
                      }
 
+                  8. For "download", use a direct file URL. Do not use this
+                     action for a website homepage or search page:
 
-                  8. TARGET FORMAT:
+                     {
+                       "action": "download",
+                       "url": "https://example.com/file.pdf"
+                     }
+
+                     When a task asks to save a file and its direct URL or
+                     identifier can be identified reliably, prefer a direct
+                     "download" step instead of browsing through search pages.
+                     Do not invent a file URL or identifier.
+
+                     For an arXiv paper with a known identifier, use its direct
+                     PDF URL (`https://arxiv.org/pdf/<id>`) with the "download"
+                     action. Do not use its abstract URL (`/abs/<id>`) as a
+                     substitute for downloading. For example, when asked to
+                     download "Attention Is All You Need" and the identifier
+                     1706.03762 is known, return one download step for
+                     `https://arxiv.org/pdf/1706.03762`.
+
+                     If the task explicitly asks to download a file and a
+                     reliable direct file URL is available, the plan must
+                     contain a "download" action. Do not return only navigation
+                     steps and treat them as completing a download task.
+
+                  9. TARGET FORMAT:
 
                      Actions that interact with a page element MUST use a semantic target
                      object instead of a simple target string.
@@ -204,7 +316,7 @@ class Planner:
                      HTML attributes, or Playwright code.
 
 
-                  9. VALID TARGET ROLES:
+                  10. VALID TARGET ROLES:
 
                      Prefer standard accessible roles when possible, including:
 
@@ -223,7 +335,7 @@ class Planner:
                      Use the role that best represents the intended DOM element.
 
 
-                  10. For "click":
+                  11. For "click":
 
                       {
                         "action": "click",
@@ -234,7 +346,7 @@ class Planner:
                       }
 
 
-                  11. For "fill":
+                  12. For "fill":
 
                       {
                         "action": "fill",
@@ -246,7 +358,7 @@ class Planner:
                       }
 
 
-                  12. For "press":
+                  13. For "press":
 
                       {
                         "action": "press",
@@ -258,7 +370,7 @@ class Planner:
                       }
 
 
-                  13. For "select":
+                  14. For "select":
 
                       {
                         "action": "select",
@@ -270,7 +382,7 @@ class Planner:
                       }
 
 
-                  14. ACTION MINIMIZATION:
+                  15. ACTION MINIMIZATION:
 
                       Generate the smallest sequence of actions necessary to complete
                       the user's task.
@@ -342,7 +454,7 @@ class Planner:
                       }
 
 
-                  15. TARGET SPECIFICITY:
+                  16. TARGET SPECIFICITY:
 
                       The target must contain enough semantic information to distinguish
                       the intended element from other elements on the page.
@@ -377,33 +489,33 @@ class Planner:
                       The role and name together should identify the intended element.
 
 
-                  16. Do NOT assume that an element exists unless the task or available
+                  17. Do NOT assume that an element exists unless the task or available
                       page information establishes it.
 
                       The execution/validation layer will verify the target against
                       the actual page.
 
 
-                  17. If multiple elements could reasonably match the target, provide
+                  18. If multiple elements could reasonably match the target, provide
                       the most specific semantic role and name available from the
                       information provided.
 
                       Do NOT invent DOM attributes, selectors, or implementation details.
 
 
-                  18. If the user's task requires multiple actions, return them in the
+                  19. If the user's task requires multiple actions, return them in the
                       order in which they must be executed.
 
 
-                  19. If information required to perform the task is missing, do NOT invent
+                  20. If information required to perform the task is missing, do NOT invent
                       it. Return a clarification action/request according to the
                       application's supported schema.
 
 
-                  20. Return ONLY valid JSON.
+                  21. Return ONLY valid JSON.
 
 
-                  21. The root JSON object MUST contain exactly one field: "steps".
+                  22. The root JSON object MUST contain exactly one field: "steps".
 
 
                   OUTPUT FORMAT:
@@ -459,12 +571,17 @@ class Planner:
           4. Use ONLY these action types:
 
              - navigate
+             - download
              - click
              - fill
              - press
              - select
              - wait
              - extract
+
+           Use {"action": "download", "url": "https://example.com/file.pdf"}
+           for a known direct file URL. Do not use it for a homepage or search page,
+           and do not invent a file URL or identifier.
 
           5. Do NOT generate:
              - explanations
@@ -628,6 +745,18 @@ class Planner:
               and DOM observations, return an empty "steps" array rather than
               inventing an action.
 
+          23. If the original task requests a file download, do not treat
+              navigation or search as completion. When no download appears in
+              successfully executed steps, preserve a valid download action from
+              the previous plan or include one when its direct URL is supported
+              by the task or observations. Do not invent a URL.
+
+          24. If a download failed with an HTTP error, do not repeat the same
+              failed URL. Use a different direct URL only when it is supported
+              by the original task or reliable observations. If no valid
+              replacement is available, return an empty "steps" array rather
+              than guessing.
+
           INPUT INFORMATION:
 
           Original user task:
@@ -724,10 +853,10 @@ class Planner:
                     print(chunk.message.content, end='', flush=True)
                     full_content += chunk.message.content
             
-            if full_content != "":
+            if full_content.strip():
               return self.save_plan(full_content)
             else:
-              raise ValueError("Plan can't be empty while saving")
+              raise ValueError("Local model returned an empty plan response")
         else:
           
           return await self.call_api(provider,task,model_name,system_prompt)

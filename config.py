@@ -3,7 +3,7 @@ MODES = ["Api","Local"]
 MODEL_NAME = 'qwen3.5:4b'
 MAX_TOKEN = 2048
 DEEPSEEK_MODEL =  "deepseek-v4-flash"
-MODE = MODES[0]
+MODE = MODES[1]
 MAX_REPLAN_ATTEMPTS = 3
 
 REPLAN_IDX = 0

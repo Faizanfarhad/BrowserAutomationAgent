@@ -7,6 +7,7 @@ from playwright.async_api import Page
 class Validater:
     VALIDATION_RULES = {
         "navigate": "URL is valid",
+        "download": "URL is valid; file response is checked during download",
         "fill": "target exists + visible + enabled + editable",
         "click": "target exists + visible + enabled",
         "press": "target exists + visible + enabled + keyboard-capable",
@@ -202,7 +203,7 @@ class Validater:
         if action not in self.VALIDATION_RULES:
             return False
 
-        if action == "navigate":
+        if action in {"navigate", "download"}:
             return self.is_url_valid(step.get("url"))
         if action == "wait":
             return await self.validate_wait(step)
