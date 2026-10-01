@@ -13,7 +13,7 @@ class Validater:
         "press": "target exists + visible + enabled + keyboard-capable",
         "select": "target exists + visible + enabled + is selectable",
         "wait": "duration/condition is valid",
-        "extract": "target exists + readable",
+        "extract": "category and requested fields are valid",
     }
 
     def __init__(self,plan:Optional[str | dict],page:Page):
@@ -207,6 +207,16 @@ class Validater:
             return self.is_url_valid(step.get("url"))
         if action == "wait":
             return await self.validate_wait(step)
+        if action == "extract":
+            category = step.get("category")
+            fields = step.get("fields")
+            return (
+                isinstance(category, str)
+                and bool(category.strip())
+                and isinstance(fields, list)
+                and bool(fields)
+                and all(isinstance(field, str) and bool(field.strip()) for field in fields)
+            )
 
         target = step.get("target")
         if not isinstance(target, dict):

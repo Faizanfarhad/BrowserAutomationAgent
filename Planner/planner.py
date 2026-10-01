@@ -19,7 +19,7 @@ class ApiProviderError(Exception):
     """Raised when an external model provider cannot complete the request."""
 
 class Planner:
-    PLAN_RESPONSE_RETRIES = 2
+    PLAN_RESPONSE_RETRIES = MAX_PLANNER_RETRIES
 
     def __init__(self,mode:Optional[str | Literal["Local","Api"]],replanning:bool = False):
         """_summary_
@@ -250,6 +250,27 @@ class Planner:
                      - select
                      - wait
                      - extract
+
+                  For "extract", specify the output category and the exact information
+                  fields requested by the user. Do not provide CSS selectors, XPath,
+                  or DOM implementation details; the executor chooses how to retrieve
+                  each field from the page.
+
+                  For product listings, include a "query" containing the specific
+                  product/model to match, and request product_name, price, currency,
+                  retailer, and product_url. Do not treat unrelated promotions as products.
+                  For current prices in India, prefer a direct Flipkart search listing;
+                  do not use Google Shopping or US-only retailers such as Best Buy and
+                  Newegg unless the user explicitly asks for them.
+
+                  Example:
+
+                  {
+                    "action": "extract",
+                    "category": "product_listing",
+                    "query": "RTX 4050 laptop",
+                    "fields": ["product_name", "price", "currency", "retailer", "product_url"]
+                  }
 
 
                   6. Each action MUST contain only the parameters required for that action.
@@ -578,6 +599,31 @@ class Planner:
              - select
              - wait
              - extract
+
+          For "extract", preserve the requested output category and fields. Do not
+          add selectors or DOM implementation details; the executor retrieves the
+          requested fields from the current page.
+
+          For product listings, include a "query" with the exact product/model to
+          match and request product_name, price, currency, retailer, and product_url.
+          Do not treat unrelated promotions as products.
+          For current prices in India, prefer a direct Flipkart search listing; do not
+          use Google Shopping or US-only retailers such as Best Buy and Newegg unless
+          the user explicitly asks for them.
+
+          Example:
+
+          {
+            "action": "extract",
+            "category": "product_listing",
+            "query": "RTX 4050 laptop",
+            "fields": ["product_name", "price", "currency", "retailer", "product_url"]
+          }
+
+          If extraction failed because requested fields were missing or the page
+          requested human verification, do not repeat extraction on that page or
+          attempt to solve the verification. Use a different reliable source. If
+          no source is supported, return an empty "steps" array.
 
            Use {"action": "download", "url": "https://example.com/file.pdf"}
            for a known direct file URL. Do not use it for a homepage or search page,

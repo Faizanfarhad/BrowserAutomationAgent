@@ -1,7 +1,10 @@
 import asyncio
 import json
 import re
+import config
+from config import * 
 from typing import Optional
+from urllib.parse import urlencode, urlparse
 from playwright.async_api import Playwright, async_playwright, Page
 
 from Planner.planner import Planner
@@ -12,6 +15,7 @@ from config import *
 from tools.dom_observation import find_relevant_element
 from tools.load_json import dir_load_json
 from tools.download import download_url
+from tools.extractor import extract_categorized
 
 
 class Executor:
@@ -28,12 +32,51 @@ class Executor:
         self.replan_attempt  = 0
         self.validation_result = None
         self.failed_downloads = []
+        self.product_search_query = None
 
     def _persist_state(self):
         save_agent_state(self.agent_state)
 
     def _task_requires_download(self):
         return re.search(r"\bdownload(?:s|ed|ing)?\b", self.original_task, re.IGNORECASE) is not None
+
+    def _route_product_search(self, plan, fallback_attempt=0):
+        """Route India-market product lookups through local retailer/search sources."""
+        steps = plan.get("steps", []) if isinstance(plan, dict) else []
+        extract_steps = [
+            step
+            for step in steps
+            if isinstance(step, dict)
+            and step.get("action") == "extract"
+            and "product" in str(step.get("category", "")).lower()
+        ]
+        if config.MARKET != "IN" or not extract_steps:
+            return plan
+
+        query = (
+            self.product_search_query
+            or extract_steps[0].get("query")
+            or self.original_task
+        )
+        self.product_search_query = query
+        for step in extract_steps:
+            step["query"] = query
+        search_query = f"site:flipkart.com {query} price INR"
+        search_urls = [
+            f"https://www.flipkart.com/search?{urlencode({'q': query})}",
+            f"https://html.duckduckgo.com/html/?{urlencode({'q': search_query, 'kl': 'in-en'})}",
+            f"https://www.bing.com/search?{urlencode({'q': search_query, 'setmkt': 'en-IN', 'setlang': 'en-IN'})}",
+            f"https://search.brave.com/search?{urlencode({'q': search_query, 'country': 'IN', 'source': 'web'})}",
+        ]
+        if fallback_attempt >= len(search_urls):
+            raise RuntimeError("No more configured product search sources remain")
+
+        return {
+            "steps": [
+                {"action": "navigate", "url": search_urls[fallback_attempt]},
+                *[step for step in steps if step.get("action") != "navigate"],
+            ]
+        }
 
     @staticmethod
     def _plan_has_download(plan):
@@ -94,14 +137,14 @@ class Executor:
         )
 
     @staticmethod
-    def _download_failure_replan_data(plan, attempt_state, error):
+    def _execution_failure_replan_data(plan, attempt_state, error):
         execution_steps = attempt_state["execution"]["steps"]
         failed_index = next(
             (
                 index
                 for index, step_state in enumerate(execution_steps)
                 if step_state["status"] == "failed"
-                and step_state["action"] == "download"
+                and step_state["action"] in {"download", "extract"}
             ),
             None,
         )
@@ -120,9 +163,11 @@ class Executor:
             f"step{failed_index + 1}": {
                 "plan_step": plan["steps"][failed_index],
                 "error": str(error),
+                "result": execution_steps[failed_index].get("result"),
             }
         }
         return {
+            "failed_action": execution_steps[failed_index]["action"],
             "executed_steps": executed_steps,
             "failed_step": failed_step,
             "current_url": attempt_state["execution"].get("current_url"),
@@ -189,6 +234,7 @@ class Executor:
         self._persist_state()
         try:
             plan = self.get_plan()
+            plan = self._route_product_search(plan)
         except Exception as error:
             attempt_state = self._new_attempt_state(1, self.planning)
             attempt_state.update({
@@ -229,7 +275,7 @@ class Executor:
                             attempt_state,
                         )
                     except Exception as error:
-                        replan_data = self._download_failure_replan_data(
+                        replan_data = self._execution_failure_replan_data(
                             plan,
                             attempt_state,
                             error,
@@ -240,22 +286,28 @@ class Executor:
                         ):
                             raise
 
-                        for failure in replan_data["failed_step"].values():
-                            if failure not in self.failed_downloads:
-                                self.failed_downloads.append(failure)
+                        if replan_data["failed_action"] == "download":
+                            for failure in replan_data["failed_step"].values():
+                                if failure not in self.failed_downloads:
+                                    self.failed_downloads.append(failure)
 
                         attempt_state["status"] = "replanning"
                         attempt_state["error"] = str(error)
-                        attempt_state["failure_stage"] = "download"
+                        attempt_state["failure_stage"] = replan_data["failed_action"]
                         self._persist_state()
+                        failure_label = replan_data["failed_action"].capitalize()
                         replan_context = {
                             "valid_info": {
                                 "valid": False,
-                                "errors": [f"Download failed: {error}"],
+                                "errors": [f"{failure_label} failed: {error}"],
                             },
                             "replan_data": replan_data,
                         }
                         new_plan = await self.create_replan(plan, replan_context)
+                        new_plan = self._route_product_search(
+                            new_plan,
+                            fallback_attempt=self.replan_attempt + 1,
+                        )
                         attempt_state["replan"] = {
                             "status": "succeeded",
                             "next_attempt": attempt_number + 1,
@@ -337,11 +389,11 @@ class Executor:
                 await validator.validate()
                 valid_info = validator.valid_info
 
-                print("#" * 20, "Validating the plan", "#" * 20)
-                print(f"Is valid: {valid_info['valid']}")
-                print(f"Validation information:\n{valid_info['table']}")
-                print("Validation results:")
-                print(valid_info)
+                print("#" * 20, "Validating the plan", "#" * 20,end="\n")
+                print(f"Is valid: {valid_info['valid']}",end="\n")
+                print(f"Validation information:\n{valid_info['table']}",end="\n")
+                print("Validation results:",end="\n")
+                print(json.dumps(valid_info, indent=2, ensure_ascii=False))
 
                 if not valid_info["valid"]:
                     replan_data = await self.collect_replan_data(
@@ -411,7 +463,26 @@ class Executor:
                 elif action == "download":
                     result = str(await download_url(page, step["url"]))
 
-                elif action in {"fill", "click", "press", "select", "extract"}:
+                elif action == "extract":
+                    result = await extract_categorized(
+                        page,
+                        step["category"],
+                        step["fields"],
+                        query=step.get("query") or self.original_task,
+                    )
+                    step_state["result"] = result
+                    if result.get("blocked"):
+                        raise RuntimeError(
+                            f"Extraction blocked: {result['blocked']}"
+                        )
+                    if result.get("missing_fields"):
+                        missing_fields = ", ".join(result["missing_fields"])
+                        raise RuntimeError(
+                            f"Extraction incomplete; missing requested fields: {missing_fields}"
+                        )
+                    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+                elif action in {"fill", "click", "press", "select"}:
                     locator = await self.get_target_locator(validator, page, step)
                     if locator is None:
                         raise ValueError("The validated target could not be resolved")
@@ -424,13 +495,6 @@ class Executor:
                         await locator.press(step["key"])
                     elif action == "select":
                         await locator.select_option(step["value"])
-                    elif action == "extract":
-                        try:
-                            result = await locator.input_value()
-                        except Exception:
-                            result = await locator.inner_text()
-                        print(f"Extracted value: {result}")
-
                     await page.screenshot(path="traces/action.png")
 
                 elif action == "wait":
@@ -485,11 +549,11 @@ class Executor:
         """Ask the planner for a corrected plan."""
         replan_data = validation_result["replan_data"]
         planner = Planner(
-            mode=MODE,
+            mode=config.MODE,
             replanning=True,
         )
 
-        if MODE == "Api":
+        if config.MODE == "Api":
             model_name = DEEPSEEK_MODEL
             provider = "deepseek"
         else:
@@ -512,14 +576,33 @@ class Executor:
         if not isinstance(new_plan, dict) or not isinstance(new_plan.get("steps"), list):
             raise ValueError("Replanner did not return a valid plan")
 
+        extraction_failed = any(
+            failure.get("plan_step", {}).get("action") == "extract"
+            for failure in replan_data["failed_step"].values()
+        )
+        if extraction_failed and not any(
+            isinstance(step, dict) and step.get("action") == "extract"
+            for step in new_plan["steps"]
+        ):
+            raise ValueError("Replanner omitted the required extraction action")
+        if extraction_failed:
+            previous_host = (urlparse(replan_data.get("current_url") or "").hostname or "").removeprefix("www.")
+            new_hosts = {
+                (urlparse(step.get("url", "")).hostname or "").removeprefix("www.")
+                for step in new_plan["steps"]
+                if isinstance(step, dict) and step.get("action") == "navigate"
+            }
+            if previous_host and previous_host in new_hosts:
+                raise ValueError(
+                    "Replanner must use a different host after extraction failed"
+                )
+            if previous_host and not new_hosts:
+                raise ValueError(
+                    "Replanner must navigate to another host after extraction failed"
+                )
+
         return new_plan
 
 async def main(planning):
     async with async_playwright() as playwright:
         await Executor(playwright, planning).do_task()
-
-
-if __name__ == "__main__":
-    path = PLAN_PATH
-    plan = dir_load_json(path)
-    asyncio.run(main(plan))

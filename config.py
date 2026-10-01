@@ -4,7 +4,10 @@ MODEL_NAME = 'qwen3.5:4b'
 MAX_TOKEN = 2048
 DEEPSEEK_MODEL =  "deepseek-v4-flash"
 MODE = MODES[1]
+MARKET = "IN"
+
 MAX_REPLAN_ATTEMPTS = 3
+MAX_PLANNER_RETRIES = 3
 
 REPLAN_IDX = 0
 PLAN_IDX = 0
@@ -16,7 +19,6 @@ SAVED_REPLAN_PATH = "saved_plan/replan"
 
 
 
-#Task 
 
 TASK = None
 

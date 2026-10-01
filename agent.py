@@ -15,9 +15,9 @@ async def run(task: str):
     if not task or not task.strip():
         raise ValueError("Task cannot be empty")
 
-    planner = Planner(mode=MODE, replanning=False)
+    planner = Planner(mode=config.MODE, replanning=False)
 
-    if MODE == "Api":
+    if config.MODE == "Api":
         provider = "deepseek"
         model_name = DEEPSEEK_MODEL
     else:
@@ -50,8 +50,12 @@ def main():
         nargs="+",
         help="The browser task, for example: search Wikipedia for Python",
     )
+    parser.add_argument("-m","--mode",type=str,default="Local",help="mode of the planner")
     args = parser.parse_args()
+    
     config.TASK = " ".join(args.task)
+    config.MODE = "".join(str.capitalize(args.mode))
+    
     asyncio.run(run(" ".join(args.task)))
 
 
