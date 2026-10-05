@@ -22,3 +22,9 @@ state/agent_state.json
 
 
 downloads/
+.browser_profile/
+credentials.json
+credential.json
+gmail_token.json
+
+client_secret_*.json

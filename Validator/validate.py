@@ -1,4 +1,5 @@
 import json
+import re
 import playwright
 from typing import Optional 
 from urllib.parse import urlparse
@@ -8,6 +9,9 @@ class Validater:
     VALIDATION_RULES = {
         "navigate": "URL is valid",
         "download": "URL is valid; file response is checked during download",
+        "api_request": "GET URL is valid; query and headers are objects",
+        "gmail_search": "Gmail OAuth search query is valid",
+        "gmail_send": "Gmail OAuth recipient, subject, and body are valid",
         "fill": "target exists + visible + enabled + editable",
         "click": "target exists + visible + enabled",
         "press": "target exists + visible + enabled + keyboard-capable",
@@ -59,6 +63,7 @@ class Validater:
         """
         self.candidates = []
         if role:
+            self.candidates.append(page.get_by_role(role, name=target, exact=True))
             self.candidates.append(page.get_by_role(role, name=target))
 
         self.candidates.extend([
@@ -87,28 +92,27 @@ class Validater:
             locator (_type_): _description_
         
         """
-        filtered = []
-        
         for candidate in candidates:
-            if await candidate.count() != 1:
-                continue
-            if not await candidate.is_visible():
-                continue
-            if action != "extract" and not await candidate.is_enabled():
-                continue
-            if action == "fill" and not await candidate.is_editable():
-                continue
-            if action == "press" and not await self.is_keyboard_capable(candidate):
-                continue
-            if action == "select" and not await self.is_selectable(candidate):
-                continue
-            if action == "extract" and not await self.is_readable(candidate):
-                continue
+            count = await candidate.count()
+            filtered = []
+            for index in range(count):
+                element = candidate.nth(index) if count > 1 else candidate
+                if not await element.is_visible():
+                    continue
+                if action != "extract" and not await element.is_enabled():
+                    continue
+                if action == "fill" and not await element.is_editable():
+                    continue
+                if action == "press" and not await self.is_keyboard_capable(element):
+                    continue
+                if action == "select" and not await self.is_selectable(element):
+                    continue
+                if action == "extract" and not await self.is_readable(element):
+                    continue
+                filtered.append(element)
 
-            filtered.append(candidate)
-
-        if len(filtered) == 1:
-            return filtered[0]
+            if len(filtered) == 1:
+                return filtered[0]
         return None
 
     async def is_keyboard_capable(self, locator):
@@ -188,6 +192,27 @@ class Validater:
         parser = urlparse(url)
         return parser.scheme in ("http", "https") and bool(parser.netloc)
 
+    @staticmethod
+    def is_valid_step_reference(value, step_number, steps):
+        """Check that a URL reference names a field from an earlier extract step."""
+        if not isinstance(value, dict) or set(value) != {"from"}:
+            return False
+
+        match = re.fullmatch(r"step([1-9]\d*)\.data\.([A-Za-z_][A-Za-z0-9_]*)", value["from"])
+        if not match:
+            return False
+
+        source_number = int(match.group(1))
+        if source_number >= step_number or source_number > len(steps):
+            return False
+
+        source_step = steps[source_number - 1]
+        return (
+            isinstance(source_step, dict)
+            and source_step.get("action") == "extract"
+            and match.group(2) in source_step.get("fields", [])
+        )
+
     async def validate_wait(self, step):
         """Validate a wait duration or a wait condition."""
         duration = step.get("duration")
@@ -197,16 +222,59 @@ class Validater:
         valid_condition = isinstance(condition, str) and bool(condition.strip())
         return valid_duration or valid_condition
 
-    async def validate_step(self, step):
+    async def validate_step(self, step, step_number=None, steps=None, check_target=True):
         """Validate one step according to its action rule."""
         action = step.get("action")
         if action not in self.VALIDATION_RULES:
             return False
 
-        if action in {"navigate", "download"}:
-            return self.is_url_valid(step.get("url"))
+        if action in {"navigate", "download", "api_request"}:
+            url = step.get("url")
+            valid_url = self.is_url_valid(url) or (
+                step_number is not None
+                and steps is not None
+                and self.is_valid_step_reference(url, step_number, steps)
+            )
+            if not valid_url:
+                return False
+            if action == "api_request":
+                method = step.get("method", "GET")
+                params = step.get("params", {})
+                headers = step.get("headers", {})
+                return (
+                    method == "GET"
+                    and isinstance(params, dict)
+                    and isinstance(headers, dict)
+                )
+            return True
         if action == "wait":
             return await self.validate_wait(step)
+        if action == "gmail_search":
+            query = step.get("query")
+            max_results = step.get("max_results", 10)
+            return (
+                isinstance(query, str)
+                and bool(query.strip())
+                and isinstance(max_results, int)
+                and not isinstance(max_results, bool)
+                and 1 <= max_results <= 25
+            )
+        if action == "gmail_send":
+            recipient = step.get("to")
+            subject = step.get("subject")
+            body = step.get("body")
+            return (
+                isinstance(recipient, str)
+                and bool(recipient.strip())
+                and isinstance(subject, str)
+                and bool(subject.strip())
+                and isinstance(body, str)
+                and bool(body.strip())
+                and all(
+                    isinstance(step.get(field, ""), str)
+                    for field in ("cc", "bcc")
+                )
+            )
         if action == "extract":
             category = step.get("category")
             fields = step.get("fields")
@@ -227,6 +295,8 @@ class Validater:
         if not isinstance(name, str) or not name.strip() or not isinstance(role, str) or not role.strip():
             return False
 
+        if not check_target:
+            return True
         return await self.is_target_available(self.page, name, role, action)
 
     def add_step_info(self, step_number, action,role, step_valid):
@@ -256,7 +326,22 @@ class Validater:
             self.valid_info["valid"] = False
             self.valid_info["error"] = "Plan steps must be a list"
             return
+        if not steps:
+            self.valid_info["valid"] = False
+            self.valid_info["error"] = "Plan steps must contain at least one action"
+            return
 
+        initial_navigation_step = next(
+            (
+                index
+                for index, step in enumerate(steps, start=1)
+                if isinstance(step, dict)
+                and step.get("action") == "navigate"
+                and isinstance(step.get("url"), str)
+            ),
+            None,
+        )
+        defer_target_checks = False
         for step_number, step in enumerate(steps, start=1):
             role = None
             if not isinstance(step, dict):
@@ -268,7 +353,12 @@ class Validater:
                 if isinstance(target, dict):
                     role = target.get("role")
                 try:
-                    step_valid = await self.validate_step(step)
+                    step_valid = await self.validate_step(
+                        step,
+                        step_number=step_number,
+                        steps=steps,
+                        check_target=not defer_target_checks,
+                    )
                 except Exception as error:
                     step_valid = False
                     self.valid_info.setdefault("errors", []).append(
@@ -277,6 +367,10 @@ class Validater:
 
             self.add_step_info(step_number, action,role, step_valid)
             plan_valid = plan_valid and step_valid
+            if action in {"navigate", "click", "fill", "press", "select"} and not (
+                action == "navigate" and step_number == initial_navigation_step
+            ):
+                defer_target_checks = True
 
         self.valid_info["valid"] = plan_valid
     

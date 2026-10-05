@@ -6,6 +6,7 @@ import os
 import httpx
 import json
 import asyncio
+import re
 from string import Template
 from pathlib import Path
 
@@ -70,9 +71,239 @@ class Planner:
         plan = json.loads(candidate)
         if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
             raise ValueError('Plan response must be a JSON object with a "steps" list')
+        if not plan["steps"]:
+          raise ValueError('Plan "steps" must contain at least one action')
         if any(not isinstance(step, dict) for step in plan["steps"]):
             raise ValueError('Every item in the plan "steps" list must be an object')
         return plan
+
+    def build_local_system_prompt(
+        self,
+        task,
+        previous_plan=None,
+        executed_steps=None,
+        failed_step=None,
+        validation_info=None,
+        current_url=None,
+        dom_observations=None,
+    ):
+        """Build a compact prompt tuned for the configured local model."""
+        if not self.replanning:
+          return """You are a browser task planner. Convert the user task into a short, ordered Playwright plan.
+
+    Return ONLY valid JSON in this exact shape: {"steps": [...]}.
+    Use only these actions:
+    - navigate: {"action":"navigate","url":"https://..."}
+    - fill: {"action":"fill","target":{"role":"textbox","name":"..."},"value":"..."}
+    - press: {"action":"press","target":{"role":"textbox","name":"..."},"key":"Enter"}
+    - click: {"action":"click","target":{"role":"link|button","name":"..."}}
+    - select: {"action":"select","target":{"role":"combobox","name":"..."},"value":"..."}
+    - wait: {"action":"wait","duration":1000}
+    - extract: {"action":"extract","category":"...","fields":["..."]}
+    - download: {"action":"download","url":"https://.../file.ext"}
+    - api_request: {"action":"api_request","method":"GET","url":"https://api.example.com/..."}
+    - gmail_search: {"action":"gmail_search","query":"is:unread","max_results":10}
+    - gmail_send: {"action":"gmail_send","to":"person@example.com","subject":"...","body":"..."}
+
+    Planning rules:
+    1. Make one executable action per step and put steps in execution order.
+    2. Use semantic role and accessible name for page controls. Use the searchbox role for search inputs when available. Never invent CSS selectors or element IDs.
+    3. Navigate to a page before interacting with or extracting from it. Extract only information available on the current page.
+    4. For search tasks, navigate to the search site, fill its search textbox, press Enter, then click the requested result. Do not replace a requested search-and-open flow with a guessed article URL.
+    5. Put all requested fields from one page in a single extract step. For an article, request article_title, first_paragraph, and official_website_url together when all are requested. Do not split them into separate extracts.
+        6. When asked to open a named link within an article, use a click step with target {"role":"link","name":"the exact link text"}, then extract the requested fields from the page it opens. If the task asks for both articles, include a second article_title and first_paragraph extraction after that click. Do not substitute an extract step with fields ["links"].
+        7. For a URL discovered by extraction, reference its earlier result exactly as {"from":"stepN.data.field_name"}. N is the one-based index of the extract step in the FINAL steps array, counting every preceding action. The source step must be earlier than the consumer, and the field must be in that step's fields list. Never guess a discovered URL.
+        8. For multi-page resource tasks, do not skip stages: search/open article; extract article fields; navigate using official_website_url; extract documentation_url; navigate using documentation_url; extract a direct resource_url; download using resource_url.
+        9. A resource_url must point to a direct file, not a homepage or landing page. Prefer links ending in a file extension or marked as downloads.
+        10. If the task requests a download, include a download step. Do not claim a download from navigation alone.
+        11. For product lists, use category product_listing, include the specific query, and request product_name, price, currency, retailer, product_url.
+        12. Do not add explanations or actions unsupported by the task.
+        13. Use api_request only for a clearly identified read-only HTTP API endpoint. API requests do not need a navigate step; use browser actions when no API endpoint is available.
+        14. Use gmail_search for Gmail read/search tasks. Its query uses Gmail search syntax, such as "is:unread" or "from:alice@example.com". Do not use it for sending, deleting, or modifying messages.
+        15. Use gmail_send only when the user explicitly asks to send an email. Require the exact recipient, subject, and body from the task. The sender is the authenticated Gmail account; do not invent a from address. Do not use gmail_send for drafts, deleting, or modifying messages.
+
+    Required sequence for a Wikipedia article followed by its official site's documentation and a direct download:
+    {"steps":[
+     {"action":"navigate","url":"https://en.wikipedia.org"},
+     {"action":"fill","target":{"role":"searchbox","name":"Search Wikipedia"},"value":"Python"},
+     {"action":"press","target":{"role":"searchbox","name":"Search Wikipedia"},"key":"Enter"},
+     {"action":"click","target":{"role":"link","name":"Python (programming language)"}},
+     {"action":"extract","category":"article","fields":["article_title","first_paragraph","official_website_url"]},
+     {"action":"navigate","url":{"from":"step5.data.official_website_url"}},
+     {"action":"extract","category":"site","fields":["documentation_url"]},
+     {"action":"navigate","url":{"from":"step7.data.documentation_url"}},
+     {"action":"extract","category":"downloadable_resource","fields":["resource_name","resource_url"]},
+     {"action":"download","url":{"from":"step9.data.resource_url"}}
+    ]}
+
+    Reference audit for this example: step 5 produces official_website_url, step 6 uses step5; step 7 produces documentation_url, step 8 uses step7; step 9 produces resource_url, step 10 uses step9. Recount from the final steps array before returning any plan.
+
+    Return a plan for the user's task message. Do not include prose outside the JSON object."""
+
+        def as_json(value):
+          return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+        return f"""You are repairing a browser automation plan. Return ONLY a JSON object with one field: "steps".
+    Use only the supported actions: navigate, click, fill, press, select, wait, extract, download, api_request, gmail_search, gmail_send.
+    Keep the original task's requested outputs and required download action. Do not invent URLs, targets, or selectors.
+    URL values extracted earlier use {{"from":"stepN.data.field_name"}} with a one-based step number and a field requested by that extract step.
+    The execution browser remains open during runtime replans. Use the current URL and DOM observations; include navigation only when needed to reach the intended page.
+    For a blocked page, do not solve verification; choose a supported alternate source. For missing fields, use observations to improve extraction and keep the current source if it remains relevant.
+    If resource_url is missing on a documentation hub and observations show a link labeled like "Download Current Documentation", navigate to that observed link, then extract the direct resource URL there. Do not retry the same extraction on the hub or treat its landing-page URL as a file.
+
+    Original task:
+    {task}
+
+    Previous plan:
+    {as_json(previous_plan)}
+
+    Executed steps:
+    {as_json(executed_steps)}
+
+    Failed step:
+    {as_json(failed_step)}
+
+    Validation:
+    {as_json(validation_info)}
+
+    Current URL:
+    {as_json(current_url)}
+
+    DOM observations:
+    {as_json(dom_observations)}
+
+    Return the smallest valid corrected sequence needed to finish the original task. Preserve extraction fields and include extract before any URL reference that depends on it."""
+
+    @staticmethod
+    def local_plan_issues(task, plan):
+        """Return missing task requirements or invalid step references in a plan."""
+        steps = plan.get("steps", [])
+        actions = {
+            step.get("action") for step in steps if isinstance(step, dict)
+        }
+        requested_fields = {
+            field.lower()
+            for step in steps
+            if isinstance(step, dict) and step.get("action") == "extract"
+            for field in step.get("fields", [])
+            if isinstance(field, str)
+        }
+        task_text = str(task).lower()
+        issues = []
+
+        if re.search(r"\bdownload(?:s|ed|ing)?\b", task_text) and "download" not in actions:
+            issues.append("The task requests a file download, but the plan has no download action.")
+        if re.search(r"\bextract(?:s|ed|ing|ion)?\b", task_text) and "extract" not in actions:
+            issues.append("The task requests extraction, but the plan has no extract action.")
+
+        required_field_checks = [
+            (
+                "article title",
+                "article" in task_text and "title" in task_text,
+                {"article_title", "title"},
+            ),
+            ("first paragraph", "first paragraph" in task_text, {"first_paragraph", "lead_paragraph"}),
+            (
+                "official website URL",
+                bool(re.search(r"official (?:website|site).{0,50}url|url.{0,50}official (?:website|site)", task_text)),
+                {"official_website_url", "official_site_url"},
+            ),
+            ("question number", "question number" in task_text, {"question_number"}),
+            ("description", "description" in task_text, {"description"}),
+        ]
+        for label, requested, accepted_names in required_field_checks:
+            if requested and not requested_fields.intersection(accepted_names):
+                issues.append(f"The plan does not extract the requested {label}.")
+
+        named_link = re.search(r"\blink to\s+\*{2}([^*]+)\*{2}", task_text)
+        if named_link:
+            target_name = re.sub(
+                r"\bwithin\b.*",
+                "",
+                named_link.group(1),
+                flags=re.IGNORECASE,
+            ).strip()
+            normalized_name = re.sub(r"[^a-z0-9]", "", target_name)
+            article_extract_index = min(
+                (
+                    index
+                    for index, step in enumerate(steps)
+                    if isinstance(step, dict)
+                    and step.get("action") == "extract"
+                    and step.get("category") == "article"
+                ),
+                default=-1,
+            )
+            link_is_opened = any(
+                isinstance(step, dict)
+                and step.get("action") == "click"
+                and isinstance(step.get("target"), dict)
+                and re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    str(step["target"].get("name", "")).lower(),
+                ) == normalized_name
+                and index > article_extract_index
+                for index, step in enumerate(steps)
+            )
+            if not link_is_opened:
+                issues.append(
+                    f"After extracting the article, click the link named '{target_name}' instead of extracting a generic links field."
+                )
+            elif "new article" in task_text or "both articles" in task_text or "its first paragraph" in task_text:
+              clicked_index = next(
+                index
+                for index, step in enumerate(steps)
+                if isinstance(step, dict)
+                and step.get("action") == "click"
+                and isinstance(step.get("target"), dict)
+                and re.sub(
+                  r"[^a-z0-9]",
+                  "",
+                  str(step["target"].get("name", "")).lower(),
+                ) == normalized_name
+                and index > article_extract_index
+              )
+              later_fields = {
+                str(field).lower()
+                for index, step in enumerate(steps)
+                if index > clicked_index
+                and isinstance(step, dict)
+                and step.get("action") == "extract"
+                for field in step.get("fields", [])
+              }
+              if not later_fields.intersection({"article_title", "title"}):
+                issues.append("After opening the named link, extract the new article title.")
+              if not later_fields.intersection({"first_paragraph", "lead_paragraph"}):
+                issues.append("After opening the named link, extract its first paragraph.")
+
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict) or step.get("action") not in {"navigate", "download"}:
+                continue
+            url = step.get("url")
+            if not isinstance(url, dict):
+                continue
+            reference = url.get("from", "")
+            match = re.fullmatch(
+                r"step([1-9]\d*)\.data\.([A-Za-z_][A-Za-z0-9_]*)",
+                reference if isinstance(reference, str) else "",
+            )
+            if not match or set(url) != {"from"}:
+                issues.append(f"Step {index} has an invalid URL reference.")
+                continue
+            source_index = int(match.group(1))
+            if source_index >= index or source_index > len(steps):
+                issues.append(f"Step {index} must reference an earlier extract step.")
+                continue
+            source_step = steps[source_index - 1]
+            if (
+                not isinstance(source_step, dict)
+                or source_step.get("action") != "extract"
+                or match.group(2) not in source_step.get("fields", [])
+            ):
+                issues.append(f"Step {index} references a field not produced by an earlier extract.")
+
+        return issues
 
     async def call_api(self, provider, task, model_name, system_prompt):
         if provider == "gemini":
@@ -250,11 +481,36 @@ class Planner:
                      - select
                      - wait
                      - extract
+                     - api_request
+                     - gmail_search
+                     - gmail_send
 
                   For "extract", specify the output category and the exact information
                   fields requested by the user. Do not provide CSS selectors, XPath,
                   or DOM implementation details; the executor chooses how to retrieve
                   each field from the page.
+
+                  Use api_request only for a clearly identified read-only HTTP API
+                  endpoint. API requests do not need a browser navigation step. If
+                  no API endpoint is available, use the browser actions.
+
+                  Use gmail_search for Gmail read/search tasks. It uses Gmail search
+                  syntax and requires the CLI Gmail OAuth setup. Do not use it for
+                  sending, deleting, or modifying messages.
+
+                  Use gmail_send only when the user explicitly asks to send an
+                  email and provides the exact recipient, subject, and body. The
+                  sender is the authenticated Gmail account.
+
+                  For article workflows, request fields such as "article_title",
+                  "first_paragraph", and "official_website_url" when applicable.
+                  After navigating to the official website, if documentation is on a
+                  separate page, extract its "documentation_url" and navigate to it.
+                  Then extract "resource_name" and "resource_url" for a direct file
+                  and use that URL in the download step with the supported reference
+                  format. Do not use a documentation landing page as a file URL, guess
+                  a URL, or combine page-specific extraction requests from different
+                  pages.
 
                   For product listings, include a "query" containing the specific
                   product/model to match, and request product_name, price, currency,
@@ -308,6 +564,21 @@ class Planner:
                      reliable direct file URL is available, the plan must
                      contain a "download" action. Do not return only navigation
                      steps and treat them as completing a download task.
+
+                     If a later navigation or download URL must come from an
+                     earlier extraction result, use a reference object instead
+                     of inventing a URL. References use one-based plan step
+                     numbers and must point to a field requested by that earlier
+                     extract step:
+
+                     {
+                       "action": "navigate",
+                       "url": {"from": "step4.data.official_website_url"}
+                     }
+
+                     A download can use the same form, such as
+                     {"from": "step6.data.resource_url"}. Always include the
+                     extract step before the action that consumes its field.
 
                   9. TARGET FORMAT:
 
@@ -538,7 +809,10 @@ class Planner:
 
                   22. The root JSON object MUST contain exactly one field: "steps".
 
-
+                  23. Never return an empty steps array if the task is still incomplete. 
+                      If the previous plan contains an invalid step, produce a corrected replacement plan using the validation information and DOM observations. 
+                      Return an empty plan only when the task itself is impossible to continue with the available information.
+                            
                   OUTPUT FORMAT:
 
                   {
@@ -599,10 +873,32 @@ class Planner:
              - select
              - wait
              - extract
+             - api_request
+             - gmail_search
+             - gmail_send
 
           For "extract", preserve the requested output category and fields. Do not
           add selectors or DOM implementation details; the executor retrieves the
           requested fields from the current page.
+
+          Use api_request only for a clearly identified read-only HTTP API endpoint.
+          API requests do not need a browser navigation step.
+
+          Use gmail_search for Gmail read/search tasks. Do not use it for sending,
+          deleting, or modifying messages.
+
+          Use gmail_send only when the user explicitly asks to send an email and
+          provides the exact recipient, subject, and body. The sender is the
+          authenticated Gmail account.
+
+          A navigate or download URL may reference a field from an earlier extract
+          step using {"from": "stepN.data.field_name"}. Step numbers are one-based.
+          Only reference a field explicitly requested by that earlier extract step.
+          Put the extraction before the dependent action; do not invent the URL.
+          For article and resource workflows, preserve the requested extraction
+          fields and add the necessary navigate/extract/download steps in order. If
+          documentation is on a separate page, extract and navigate to
+          "documentation_url" before looking for a direct "resource_url" to download.
 
           For product listings, include a "query" with the exact product/model to
           match and request product_name, price, currency, retailer, and product_url.
@@ -620,10 +916,19 @@ class Planner:
             "fields": ["product_name", "price", "currency", "retailer", "product_url"]
           }
 
-          If extraction failed because requested fields were missing or the page
-          requested human verification, do not repeat extraction on that page or
-          attempt to solve the verification. Use a different reliable source. If
-          no source is supported, return an empty "steps" array.
+          Treat extraction failures according to their cause:
+
+          - If requested fields are missing but the page is not blocked, use the
+            supplied page observations to improve the extraction attempt. Keep the
+            same host and navigate to the current page URL unless the observations
+            show that the page is irrelevant or unavailable.
+          - If the page requests CAPTCHA or human verification, do not attempt to
+            solve it. Use a different reliable host; if no source is supported,
+            return an empty "steps" array.
+
+          Every replan runs in a fresh browser context. Include a "navigate" step
+          to the current page URL (or the selected alternate source) so the retry
+          actually opens the page before continuing.
 
            Use {"action": "download", "url": "https://example.com/file.pdf"}
            for a known direct file URL. Do not use it for a homepage or search page,
@@ -803,6 +1108,10 @@ class Planner:
               replacement is available, return an empty "steps" array rather
               than guessing.
 
+          25. Never return an empty steps array if the task is still incomplete. 
+              If the previous plan contains an invalid step, produce a corrected replacement plan using the validation information and DOM observations. 
+              Return an empty plan only when the task itself is impossible to continue with the available information.
+          
           INPUT INFORMATION:
 
           Original user task:
@@ -862,47 +1171,85 @@ class Planner:
           )
           
         if self.mode == "Local":
+            system_prompt = self.build_local_system_prompt(
+                task=task,
+                previous_plan=previous_plan,
+                executed_steps=executed_steps,
+                failed_step=failed_step,
+                validation_info=validation_info,
+                current_url=current_url,
+                dom_observations=dom_observations,
+            )
             
             client = ollama.AsyncClient()
-            stream = await client.chat(
-                    model=model_name, # i used local model 
-                    think=think,  # using thinking mode 
-                    stream=True,   #  Used stream true because i want to show the thinking process 
-                    format="json",  # gives output into  json format 
-                    messages=[
-                        {"role": "system", 
-                         "content":str(system_prompt)},
-                        {"role": "user",
-                         "content": str(f'{task}')},
-                    ]
-                )
-                
-            in_thinking = False
-            full_thinking = ""
-            full_content = ""
-                
-            async for chunk in stream:
-                # Check for thinking tokens
+            messages = [
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": str(task)},
+            ]
+            last_issues = ["Local model returned an empty plan response."]
+
+            for attempt in range(self.PLAN_RESPONSE_RETRIES + 1):
+              print(
+                f"\n=== LOCAL PLAN ATTEMPT {attempt + 1}/"
+                f"{self.PLAN_RESPONSE_RETRIES + 1} ===",
+                flush=True,
+              )
+              stream = await client.chat(
+                model=model_name,
+                think=think,
+                stream=True,
+                format="json",
+                options={"temperature": 0, "num_predict": MAX_TOKEN},
+                messages=messages,
+              )
+
+              in_thinking = False
+              full_content = ""
+              async for chunk in stream:
                 if chunk.message.thinking:
-                    if not in_thinking:
-                        in_thinking = True
-                        print("<thinking>", flush=True)
-                    print(chunk.message.thinking, end='', flush=True)
-                    full_thinking += chunk.message.thinking
-                
-                # Check for final answer tokens
+                  if not in_thinking:
+                    in_thinking = True
+                    print("<thinking>", flush=True)
+                  print(chunk.message.thinking, end="", flush=True)
                 elif chunk.message.content:
-                    if in_thinking:
-                        print("\n</thinking>\n", flush=True)
-                        print("\n=== FINAL ANSWER ===", flush=True)
-                        in_thinking = False
-                    print(chunk.message.content, end='', flush=True)
-                    full_content += chunk.message.content
-            
-            if full_content.strip():
-              return self.save_plan(full_content)
-            else:
-              raise ValueError("Local model returned an empty plan response")
+                  if in_thinking:
+                    print("\n</thinking>\n\n=== FINAL ANSWER ===", flush=True)
+                    in_thinking = False
+                  print(chunk.message.content, end="", flush=True)
+                  full_content += chunk.message.content
+
+              try:
+                plan = self.parse_plan_response(full_content)
+                last_issues = (
+                  self.local_plan_issues(task, plan)
+                  if not self.replanning
+                  else []
+                )
+              except (json.JSONDecodeError, ValueError) as error:
+                last_issues = [f"Return valid plan JSON: {error}"]
+              else:
+                if not last_issues:
+                  return self.save_plan(plan)
+
+              if attempt < self.PLAN_RESPONSE_RETRIES:
+                messages.extend([
+                  {"role": "assistant", "content": full_content},
+                  {
+                    "role": "user",
+                    "content": (
+                      "The plan is incomplete or invalid:\n- "
+                      + "\n- ".join(last_issues)
+                      + "\nReturn a complete corrected JSON plan. Preserve all requested outputs, "
+                      "include a download action when requested, and check every step reference "
+                      "against the final one-based step order."
+                    ),
+                  },
+                ])
+
+            raise ValueError(
+              "Local model could not produce a complete plan after "
+              f"{self.PLAN_RESPONSE_RETRIES + 1} attempts: {'; '.join(last_issues)}"
+            )
         else:
           
           return await self.call_api(provider,task,model_name,system_prompt)

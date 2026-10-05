@@ -16,8 +16,14 @@ REPLAN_PATH = f"saved_plan/replan/replan{REPLAN_IDX}.json"
 SAVED_PLAN_PATH = "saved_plan"
 SAVED_REPLAN_PATH = "saved_plan/replan"
 
-
-
+#make false if you wanna see agent live working 
+HEADLESS = False
+PORT = 4555
+PERSISTENT_CHROME = False
+CHROME_PROFILE_DIR = ".browser_profile"
+CHROME_EXECUTABLE = "google-chrome"
+CHROME_CDP_ENDPOINT = f"http://127.0.0.1:{PORT}"
+API_TIMEOUT_SECONDS = 30
 
 
 TASK = None

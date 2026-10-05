@@ -29,9 +29,9 @@ async def extract_categorized(page, category, fields, query=None):
                 const key = normalize(field);
                 const aliases = new Set([key]);
                 const groups = [
-                    ["title", "headline", "name"],
+                    ["title", "articletitle", "headline", "name"],
                     ["author", "authors", "creator"],
-                    ["abstract", "description", "summary"],
+                    ["abstract", "description", "summary", "firstparagraph", "leadparagraph"],
                     ["publicationdate", "datepublished", "datecreated"],
                     ["pdfurl", "contenturl", "encodingurl"],
                 ];
@@ -82,6 +82,60 @@ async def extract_categorized(page, category, fields, query=None):
                     return element.value || "";
                 }
                 return element.getAttribute("content") || element.innerText || element.textContent;
+            };
+
+            const officialWebsiteLink = () => {
+                for (const row of document.querySelectorAll("tr")) {
+                    const cells = Array.from(row.querySelectorAll("th, td"));
+                    const labelIndex = cells.findIndex(cell =>
+                        /official\\s+website|website/i.test(cell.innerText || "")
+                    );
+                    if (labelIndex >= 0) {
+                        const link = cells.slice(labelIndex + 1)
+                            .flatMap(cell => Array.from(cell.querySelectorAll("a[href]")))
+                            .find(anchor => isVisibleInDom(anchor));
+                        if (link) return link;
+                    }
+                }
+
+                for (const term of document.querySelectorAll("dt")) {
+                    if (!/official\\s+website|website/i.test(term.innerText || "")) continue;
+                    const link = term.nextElementSibling?.querySelector("a[href]");
+                    if (link && isVisibleInDom(link)) return link;
+                }
+
+                return Array.from(document.querySelectorAll("a[href]"))
+                    .find(link => /official\\s+website/i.test(
+                        `${link.innerText} ${link.getAttribute("aria-label") || ""}`
+                    ));
+            };
+
+            const documentationLink = () =>
+                Array.from(document.querySelectorAll("a[href]"))
+                    .filter(link => isVisibleInDom(link))
+                    .find(link => /documentation|\bdocs\b/i.test(
+                        `${link.innerText} ${link.getAttribute("aria-label") || ""}`
+                    ));
+
+            const resourceLink = () => {
+                const filePattern = /\\.(?:svg|png|jpe?g|gif|webp|avif|bmp|ico|tiff?|pdf|docx?|odt|rtf|pptx?|xlsx?|csv|txt|md|json|xml|ya?ml|zip|tar(?:\\.(?:gz|xz|bz2))?|tgz|7z|rar|gz|bz2|xz|mp3|wav|ogg|flac|m4a|mp4|webm|mov|avi|mkv|woff2?|ttf|otf|whl|exe|msi|dmg|pkg|deb|rpm)(?:$|[?#])/i;
+                const candidates = Array.from(document.querySelectorAll("a[href]"))
+                    .filter(link => isVisibleInDom(link))
+                    .map(link => {
+                        const text = `${link.innerText || ""} ${link.title || ""}`.trim();
+                        const isFile = filePattern.test(link.href) || link.hasAttribute("download");
+                        if (!isFile) return { link, text, score: 0 };
+                        let score = 0;
+                        if (isFile) score += 12;
+                        if (link.hasAttribute("download")) score += 4;
+                        if (/download/i.test(text)) score += 2;
+                        if (/manual|reference|tutorial/i.test(text)) score += 1;
+                        if (/privacy|cookie|login|sign\\s*in/i.test(text)) score -= 20;
+                        return { link, text, score };
+                    })
+                    .filter(candidate => candidate.score > 0)
+                    .sort((left, right) => right.score - left.score);
+                return candidates[0]?.link || null;
             };
 
             const jsonLdValues = aliases => {
@@ -197,6 +251,42 @@ async def extract_categorized(page, category, fields, query=None):
 
             const extractField = field => {
                 const aliases = aliasesFor(field);
+                const fieldKey = normalize(field);
+
+                if (["pageurl", "currentpageurl"].includes(fieldKey)) {
+                    return window.location.href;
+                }
+
+                if (["pagetitle", "documenttitle"].includes(fieldKey)) {
+                    return document.title?.trim() || null;
+                }
+
+                if (["firstparagraph", "leadparagraph"].includes(fieldKey)) {
+                    const contentRoot = document.querySelector(
+                        "article, main, [role='main'], .mw-parser-output"
+                    ) || document.body;
+                    const paragraph = Array.from(contentRoot.querySelectorAll("p"))
+                        .find(element => isVisibleInDom(element) && (element.innerText || "").trim());
+                    return paragraph?.innerText?.trim() || null;
+                }
+
+                if (["officialwebsiteurl", "officialsiteurl", "websiteurl"].includes(fieldKey)) {
+                    return officialWebsiteLink()?.href || null;
+                }
+
+                if (["documentationurl", "docsurl", "documentationlink"].includes(fieldKey)) {
+                    return documentationLink()?.href || null;
+                }
+
+                if (["resourceurl", "downloadurl", "downloadableresourceurl", "documentationurl"].includes(fieldKey)) {
+                    return resourceLink()?.href || null;
+                }
+
+                if (["resourcename", "downloadname", "downloadableresourcename", "documentationname"].includes(fieldKey)) {
+                    const link = resourceLink();
+                    return link?.innerText?.trim() || link?.getAttribute("aria-label") || null;
+                }
+
                 const values = jsonLdValues(aliases);
 
                 for (const meta of document.querySelectorAll("meta")) {
